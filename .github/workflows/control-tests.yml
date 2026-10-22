@@ -1,0 +1,20 @@
+name: Control regression checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile control tests
+        run: >-
+          g++ -std=c++11 -Wall -Wextra -Werror -pedantic
+          -fsanitize=undefined,float-cast-overflow -fno-sanitize-recover=all
+          -D__AVR_ATmega328P__ -Itests/stubs tests/control_test.cpp
+          -o /tmp/robot-control-test
+      - name: Run control tests
+        run: /tmp/robot-control-test

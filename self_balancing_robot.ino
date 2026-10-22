@@ -1,178 +1,247 @@
-class classCar
-{
-private:
-uint8_t _pin1;
-uint8_t _pin2;
-uint8_t _pin3;
-uint8_t _pin4;
-public:
-classCar(uint8_t pin1, uint8_t pin2, uint8_t pin3, uint8_t pin4)
-{
-_pin1 = pin1;
-_pin2 = pin2;
-_pin3 = pin3;
-_pin4 = pin4;
-pinMode(_pin1, OUTPUT);
-pinMode(_pin2, OUTPUT);
-pinMode(_pin3, OUTPUT);
-pinMode(_pin4, OUTPUT);
-}
-forward(uint8_t dutyCycle)
-{
-analogWrite(_pin1, dutyCycle);
-analogWrite(_pin2, 0);
-analogWrite(_pin3, dutyCycle);
-analogWrite(_pin4, 0);
-}
-backward(uint8_t dutyCycle)
-{
-analogWrite(_pin1, 0);
-analogWrite(_pin2, -dutyCycle);
-analogWrite(_pin3, 0);
-analogWrite(_pin4, -dutyCycle);
-}
-STOP()
-{
-analogWrite(_pin1, 0);
-analogWrite(_pin2, 0);
-analogWrite(_pin3, 0);
-analogWrite(_pin4, 0);
-}
-};
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
 #include "I2Cdev.h"
-#include <PID_v1.h> //From https://github.com/br3ttb/Arduino-PID-Library/blob/master/PID_v1.h
-#include "MPU6050_6Axis_MotionApps20.h" //https://github.com/jrowberg/i2cdevlib/tree/master/Arduino/MPU6050
-classCar car(3, 9, 10, 11);
-MPU6050 mpu;
-// MPU control/status vars
-bool dmpReady = false; // set true if DMP init was successful
-uint8_t mpuIntStatus; // holds actual interrupt status byte from MPU
-uint8_t devStatus; // return status after each device operation (0 = success, !0 = error)
-uint16_t packetSize; // expected DMP packet size (default is 42 bytes)
-uint16_t fifoCount; // count of all bytes currently in FIFO
-uint8_t fifoBuffer[64]; // FIFO storage buffer
-// orientation/motion vars
-Quaternion q; // [w, x, y, z] quaternion container
-VectorFloat gravity; // [x, y, z] gravity vector
-float ypr[3]; // [yaw, pitch, roll] yaw/pitch/roll container and gravity vector
+#include <PID_v1.h>
+#include "MPU6050_6Axis_MotionApps20.h"
 
-double setPoint= 179;
-double Kp = 21; //Set this first
-double Kd = 0.8; //Set this secound
-double Ki = 50; //Finally set this
-double input, output;
-PID pid(&input, &output, &setPoint, Kp, Ki, Kd, DIRECT);
-volatile bool mpuInterrupt = false; // indicates whether MPU interrupt pin has gone high
-void dmpDataReady()
-{
-mpuInterrupt = true;
-Serial.print(input);
-Serial.print("\n");
+// Pin mapping and direct timer configuration below target the ATmega328P Uno.
+#if !defined(__AVR_ATmega328P__)
+#error "Select an ATmega328P Arduino Uno or port the motor pins and PWM timers."
+#endif
+#if I2CDEV_IMPLEMENTATION != I2CDEV_ARDUINO_WIRE
+#error "Use I2Cdev's Arduino Wire backend so I2C timeouts apply."
+#endif
+
+namespace {
+constexpr uint8_t kMotorAForward = 3;
+constexpr uint8_t kMotorAReverse = 9;
+constexpr uint8_t kMotorBForward = 10;
+constexpr uint8_t kMotorBReverse = 11;
+constexpr int kMaxPwm = 255;
+constexpr uint16_t kFifoCapacity = 1024;
+constexpr uint8_t kFifoOverflowMask = 0x10;
+constexpr uint32_t kSampleTimeMs = 10;
+constexpr uint32_t kSensorTimeoutMs = 100;
+constexpr uint32_t kWireTimeoutUs = 3000;
+constexpr uint16_t kI2cReadTimeoutMs = 10;
+constexpr uint8_t kMpuAddress = 0x68;  // AD0 low; change if wired high.
+constexpr double kMinAngle = 160.0;
+constexpr double kMaxAngle = 200.0;
+constexpr double kKp = 21.0;
+constexpr double kKi = 50.0;
+constexpr double kKd = 0.8;
+constexpr double kRadiansToDegrees = 180.0 / PI;
+
+class MotorDriver {
+ public:
+  // Hardware access belongs in setup(), after the Arduino core initializes.
+  void begin() {
+    pinMode(kMotorAForward, OUTPUT);
+    pinMode(kMotorAReverse, OUTPUT);
+    pinMode(kMotorBForward, OUTPUT);
+    pinMode(kMotorBReverse, OUTPUT);
+    stop();
+  }
+
+  void stop() {
+    analogWrite(kMotorAForward, 0);
+    analogWrite(kMotorAReverse, 0);
+    analogWrite(kMotorBForward, 0);
+    analogWrite(kMotorBReverse, 0);
+  }
+
+  void drive(int command) {
+    command = constrain(command, -kMaxPwm, kMaxPwm);
+    if (command > 0) {
+      // Disable the opposite direction before enabling PWM on either motor.
+      analogWrite(kMotorAReverse, 0);
+      analogWrite(kMotorBReverse, 0);
+      analogWrite(kMotorAForward, command);
+      analogWrite(kMotorBForward, command);
+    } else if (command < 0) {
+      analogWrite(kMotorAForward, 0);
+      analogWrite(kMotorBForward, 0);
+      analogWrite(kMotorAReverse, -command);
+      analogWrite(kMotorBReverse, -command);
+    } else {
+      stop();
+    }
+  }
+};
+
+MotorDriver motors;
+MPU6050 mpu(kMpuAddress);
+double setPoint = 179.0;  // Pitch in degrees plus 180; calibrate for the robot.
+double input = 0.0;
+double output = 0.0;
+PID pid(&input, &output, &setPoint, kKp, kKi, kKd, DIRECT);
+bool dmpReady = false;
+bool controllerActive = false;
+bool haveSample = false;
+uint16_t packetSize = 0;
+uint8_t fifoBuffer[64] = {};
+uint32_t lastSampleMs = 0;
+
+bool isBalanceAngle(double angle) {
+  return isfinite(angle) && angle > kMinAngle && angle < kMaxAngle;
 }
+
+void stopController() {
+  motors.stop();
+  pid.SetMode(MANUAL);
+  output = 0.0;
+  controllerActive = false;
+  haveSample = false;
+}
+
+void configurePwm() {
+  // Preserve the original fast PWM /8 settings (about 7.8 kHz at 16 MHz).
+  // Save/restore interrupt state; leave Timer0 (millis/delay) untouched.
+  const uint8_t savedStatus = SREG;
+  noInterrupts();
+  TCCR1A = _BV(WGM10);
+  TCCR1B = _BV(WGM12) | _BV(CS11);
+  TCCR2A = _BV(WGM20) | _BV(WGM21);
+  TCCR2B = _BV(CS21);
+  // analogWrite enables the appropriate non-inverting compare channel.
+  SREG = savedStatus;
+}
+
+bool wireTimedOut() {
+  if (!Wire.getWireTimeoutFlag()) return false;
+  Wire.clearWireTimeoutFlag();
+  return true;
+}
+
+bool readSensorBytes(uint8_t reg, uint8_t* data, uint8_t length) {
+  // MPU6050 getFIFOBytes/getFIFOCount discard the underlying read result.
+  // Check it explicitly so a disconnect or short read cannot reuse old bytes.
+  const int8_t count = I2Cdev::readBytes(kMpuAddress, reg, length, data,
+                                        kI2cReadTimeoutMs);
+  const bool timeout = wireTimedOut();
+  return count == length && !timeout;
+}
+
+void discardSensorData() {
+  stopController();
+  mpu.resetFIFO();
+  Wire.clearWireTimeoutFlag();
+}
+}  // namespace
+
 void setup() {
-Serial.begin(115200);
-// initialize device
-Serial.println(F("Initializing I2C devices..."));
-mpu.initialize();
-// verify connection
-Serial.println(F("Testing device connections..."));
-Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
-// load and configure the DMP
-devStatus = mpu.dmpInitialize();
-// supply your own gyro offsets here, scaled for min sensitivity
-mpu.setXGyroOffset(76);
-mpu.setYGyroOffset(2);
-mpu.setZGyroOffset(82);
-mpu.setZAccelOffset(870);
-// make sure it worked (returns 0 if so)
-if (devStatus == 0)
-{
-// turn on the DMP, now that it's ready
-Serial.println(F("Enabling DMP..."));
-mpu.setDMPEnabled(true);
-// enable Arduino interrupt detection
-Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
-attachInterrupt(0, dmpDataReady, RISING);
-mpuIntStatus = mpu.getIntStatus();
-// set our DMP Ready flag so the main loop() function knows it's okay to use it
-Serial.println(F("DMP ready! Waiting for first interrupt..."));
-dmpReady = true;
-// get expected DMP packet size for later comparison
-packetSize = mpu.dmpGetFIFOPacketSize();
-//setup PID
-pid.SetMode(AUTOMATIC);
-pid.SetSampleTime(10);
-pid.SetOutputLimits(-255, 255);
-}
-else
-{
-// ERROR!
-// 1 = initial memory load failed
+  motors.begin();
+  configurePwm();
+  motors.stop();
+  Serial.begin(115200);
+  Wire.begin();
+  // Requires the timeout API in Arduino AVR Boards 1.8.6 (or compatible).
+  Wire.setWireTimeout(kWireTimeoutUs, true);
+  Wire.clearWireTimeoutFlag();
+  mpu.initialize();
+  if (!mpu.testConnection() || wireTimedOut()) {
+    Serial.println(F("MPU6050 connection failed; motors disabled."));
+    return;
+  }
 
-// 2 = DMP configuration updates failed
-// (if it's going to break, usually the code will be 1)
-Serial.print(F("DMP Initialization failed (code "));
-Serial.print(devStatus);
-Serial.println(F(")"));
+  const uint8_t status = mpu.dmpInitialize();
+  if (status != 0 || wireTimedOut()) {
+    Serial.print(F("DMP initialization failed; status: "));
+    Serial.println(status);
+    return;
+  }
+  // Original calibration values; replace with measurements for your sensor.
+  mpu.setXGyroOffset(76);
+  mpu.setYGyroOffset(2);
+  mpu.setZGyroOffset(82);
+  mpu.setZAccelOffset(870);
+  packetSize = mpu.dmpGetFIFOPacketSize();
+  if (packetSize == 0 || packetSize > sizeof(fifoBuffer) || wireTimedOut()) {
+    Serial.println(F("Invalid DMP packet size or I2C timeout; motors disabled."));
+    return;
+  }
+  mpu.setDMPEnabled(true);
+  mpu.resetFIFO();
+  if (wireTimedOut()) return;
+
+  pid.SetSampleTime(kSampleTimeMs);
+  pid.SetOutputLimits(-kMaxPwm, kMaxPwm);
+  // Stay in MANUAL until the first valid, in-range pitch sample arrives.
+  dmpReady = true;
+  Serial.println(F("DMP ready; waiting for valid pitch data."));
 }
-noInterrupts();
-TCCR1A = 0; //Timer/Counter Control Register 1(timer 1) A
-TCCR1B = 0; //Timer/Counter Control Register 1(timer 1) B
-TCCR2A = 0; //Timer/Counter Control Register 2(timer 2) A
-TCCR2B = 0; //Timer/Counter Control Register 2(timer 2) B
-TCCR2B |= (1<<CS21);
-TCCR1B |= (1<<CS11);
-TCCR2A |= 3;
-TCCR1A |= 1;
-TCCR1B |= (1 << WGM12);
-TCCR1A |= (B00001010 << COM1B0);
-TCCR2A |= (B00001010 << COM2B0);
-interrupts();
-car.STOP();
-}
+
 void loop() {
-// if programming failed, don't try to do anything
-if (!dmpReady) return;
-// wait for MPU interrupt or extra packet(s) available
-while (!mpuInterrupt && fifoCount < packetSize)
-{
-//no mpu data - performing PID calculations and output to motors
-pid.Compute();
-if (input>160 && input<200){//If the Bot is falling
-if (output>0) //Falling towards front
-car.forward(output); //Rotate the wheels forward
-else if (output<0) //Falling towards back
-car.backward(output); //Rotate the wheels backward
-}
-else //If Bot not falling
-car.STOP(); //Hold the wheels still
-}
-// reset interrupt flag and get INT_STATUS byte
-mpuInterrupt = false;
-mpuIntStatus = mpu.getIntStatus();
-// get current FIFO count
-fifoCount = mpu.getFIFOCount();
-// check for overflow (this should never happen unless our code is too inefficient)
-if ((mpuIntStatus & 0x10) || fifoCount == 1024)
-{
-// reset so we can continue cleanly
-mpu.resetFIFO();
-Serial.println(F("FIFO overflow!"));
-// otherwise, check for DMP data ready interrupt (this should happen frequently)
-}
-else if (mpuIntStatus & 0x02)
-{
-// wait for correct available data length, should be a VERY short wait
-while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+  if (!dmpReady) {
+    stopController();
+    return;
+  }
 
-// read a packet from FIFO
-mpu.getFIFOBytes(fifoBuffer, packetSize);
-// track FIFO count here in case there is > 1 packet available
-// (this lets us immediately read more without waiting for an interrupt)
-fifoCount -= packetSize;
-mpu.dmpGetQuaternion(&q, fifoBuffer); //get value for q
-mpu.dmpGetGravity(&gravity, &q); //get value for gravity
-mpu.dmpGetYawPitchRoll(ypr, &q, &gravity); //get value for ypr
-input = ypr[1] * 180/M_PI + 180;
-}
+  // Unsigned subtraction also works across the millis() rollover.
+  if (haveSample && static_cast<uint32_t>(millis() - lastSampleMs) >= kSensorTimeoutMs) {
+    discardSensorData();
+    return;
+  }
+
+  // Poll FIFO directly: no serial work in an ISR and no dependency on INT wiring.
+  uint8_t status = 0;
+  uint8_t countBytes[2] = {};
+  if (!readSensorBytes(MPU6050_RA_INT_STATUS, &status, 1) ||
+      !readSensorBytes(MPU6050_RA_FIFO_COUNTH, countBytes, 2)) {
+    discardSensorData();
+    return;
+  }
+  uint16_t fifoCount = (static_cast<uint16_t>(countBytes[0]) << 8) | countBytes[1];
+  if ((status & kFifoOverflowMask) || fifoCount >= kFifoCapacity) {
+    discardSensorData();
+    return;
+  }
+  // Never busy-wait for a partial packet. The timeout above still runs.
+  if (fifoCount < packetSize) return;
+
+  // Drain only this bounded snapshot; decode the newest complete packet.
+  while (fifoCount >= packetSize) {
+    if (!readSensorBytes(MPU6050_RA_FIFO_R_W, fifoBuffer,
+                         static_cast<uint8_t>(packetSize))) {
+      discardSensorData();
+      return;
+    }
+    fifoCount -= packetSize;
+  }
+  uint8_t afterReadStatus = 0;
+  if (!readSensorBytes(MPU6050_RA_INT_STATUS, &afterReadStatus, 1) ||
+      (afterReadStatus & kFifoOverflowMask)) {
+    discardSensorData();
+    return;
+  }
+
+  Quaternion orientation;
+  VectorFloat gravity;
+  float angles[3];
+  mpu.dmpGetQuaternion(&orientation, fifoBuffer);
+  mpu.dmpGetGravity(&gravity, &orientation);
+  mpu.dmpGetYawPitchRoll(angles, &orientation, &gravity);
+  input = angles[1] * kRadiansToDegrees + 180.0;
+  if (!isBalanceAngle(input)) {
+    stopController();
+    return;
+  }
+
+  lastSampleMs = millis();
+  haveSample = true;
+  if (!controllerActive) {
+    // MANUAL -> AUTOMATIC seeds the integral from zero and derivative from input.
+    output = 0.0;
+    pid.SetMode(AUTOMATIC);
+    controllerActive = true;
+  }
+  pid.Compute();
+  if (!isfinite(output)) {
+    stopController();
+    return;
+  }
+  // Clamp while still floating-point, then convert to a signed PWM command.
+  motors.drive(static_cast<int>(constrain(output, -static_cast<double>(kMaxPwm),
+                                         static_cast<double>(kMaxPwm))));
 }
